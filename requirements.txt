@@ -1,0 +1,8 @@
+openai-whisper
+keyboard
+sounddevice
+soundfile
+pywin32
+numpy
+requests
+python-dotenv
