@@ -8,11 +8,9 @@ import sounddevice as sd
 import soundfile as sf
 import numpy as np
 import tempfile
-import os
 import threading
 import time
 import requests
-import json
 import win32clipboard
 import win32con
 import win32api
@@ -22,18 +20,57 @@ from overlay import start_overlay, hide_overlay
 DEEPSEEK_API_KEY = os.getenv("DEEPSEEK_API_KEY")
 WHISPER_MODEL    = "small"
 SAMPLE_RATE      = 16000
+CHUNK_SECONDS    = 8
+MIN_AUDIO_LENGTH = SAMPLE_RATE * 1  # minimum 1 second of audio
 # ──────────────────────────────────────────────────────
 
 print("Loading Whisper model...")
 model = whisper.load_model(WHISPER_MODEL)
+whisper_lock = threading.Lock()
 print("Ready. Press Ctrl+Win to start/stop recording.")
 
-is_recording  = False
-audio_frames  = []
+is_recording       = False
+audio_buffer       = []
+transcribed_chunks = []
+buffer_lock        = threading.Lock()
 
-# ─── AUDIO RECORDING ──────────────────────────────────
+# ─── TRANSCRIBE A SINGLE CHUNK ────────────────────────
+def transcribe_chunk(audio_data):
+    if len(audio_data) < MIN_AUDIO_LENGTH:
+        return ""
+    tmp = tempfile.NamedTemporaryFile(suffix=".wav", delete=False)
+    tmp_path = tmp.name
+    tmp.close()
+    sf.write(tmp_path, audio_data, SAMPLE_RATE)
+    with whisper_lock:
+        result = model.transcribe(tmp_path, fp16=False)
+    text = result["text"].strip()
+    os.remove(tmp_path)
+    return text
+
+# ─── BACKGROUND CHUNK PROCESSOR ───────────────────────
+def chunk_processor():
+    global audio_buffer, transcribed_chunks
+    while is_recording:
+        time.sleep(CHUNK_SECONDS)
+        if not is_recording:
+            break
+        with buffer_lock:
+            if not audio_buffer:
+                continue
+            chunk_data = np.concatenate(audio_buffer, axis=0)
+            audio_buffer = []
+        if len(chunk_data) < MIN_AUDIO_LENGTH:
+            continue
+        print("Processing background chunk...")
+        text = transcribe_chunk(chunk_data)
+        if text:
+            print(f"Chunk: {text}")
+            transcribed_chunks.append(text)
+
+# ─── RECORD AUDIO ─────────────────────────────────────
 def record_audio():
-    global audio_frames
+    global audio_buffer
     try:
         device_id = sd.query_devices(kind='input')['index']
     except Exception:
@@ -42,7 +79,8 @@ def record_audio():
                         channels=1, dtype='float32') as stream:
         while is_recording:
             chunk, _ = stream.read(1024)
-            audio_frames.append(chunk)
+            with buffer_lock:
+                audio_buffer.append(chunk)
 
 # ─── PASTE TEXT ───────────────────────────────────────
 def paste_text(text):
@@ -58,6 +96,8 @@ def paste_text(text):
 
 # ─── DEEPSEEK CLEANUP ─────────────────────────────────
 def clean_with_deepseek(text):
+    if not text or len(text.strip()) < 5:
+        return text
     print("Cleaning with DeepSeek...")
     try:
         response = requests.post(
@@ -72,22 +112,22 @@ def clean_with_deepseek(text):
                     {
                         "role": "system",
                         "content": (
-                            "You are a transcription cleaner. Your job is light cleanup only. "
-                            "Rules: "
-                            "1. Remove filler words: um, uh, like, you know, basically, literally. "
-                            "2. Fix obvious punctuation only. "
-                            "3. Keep the original meaning 100% intact. "
-                            "4. Keep the user's original words and phrasing as much as possible. "
-                            "5. Do NOT rephrase, rewrite, or restructure sentences. "
-                            "6. Do NOT add words that were not said. "
-                            "7. Return ONLY the cleaned text. No explanations, no quotes."
+                            "You are a transcription cleaner. "
+                            "Remove filler words like um, uh, like, you know. "
+                            "Fix grammar and punctuation. "
+                            "Keep original meaning 100% intact. "
+                            "Keep user's original words as much as possible. "
+                            "Do NOT rephrase or restructure sentences. "
+                            "Do NOT add words that were not said. "
+                            "Return ONLY the cleaned text. No explanations. "
+                            "If the input is empty or nonsense, return it as-is."
                         )
                     },
                     {"role": "user", "content": text}
                 ],
-                "max_tokens": 1000
+                "max_tokens": 2000
             },
-            timeout=10
+            timeout=15
         )
         response.raise_for_status()
         cleaned = response.json()["choices"][0]["message"]["content"].strip()
@@ -97,67 +137,61 @@ def clean_with_deepseek(text):
         print(f"DeepSeek failed, using raw text: {e}")
         return text
 
-# ─── TRANSCRIBE & PASTE ───────────────────────────────
+# ─── STOP AND FINALIZE ────────────────────────────────
 def stop_and_transcribe():
-    global is_recording
+    global is_recording, audio_buffer, transcribed_chunks
+    is_recording = False
+    time.sleep(0.5)
+
     try:
-        is_recording = False
-        time.sleep(0.3)
-        try:
-            hide_overlay()
-        except Exception as e:
-            print(f"Overlay hide error: {e}")
-
-        print(f"Audio frames collected: {len(audio_frames)}")
-
-        if not audio_frames:
-            print("No audio recorded.")
-            return
-
-        audio_data = np.concatenate(audio_frames, axis=0)
-        print(f"Audio shape: {audio_data.shape}")
-
-        tmp = tempfile.NamedTemporaryFile(suffix=".wav", delete=False)
-        tmp_path = tmp.name
-        tmp.close()
-        sf.write(tmp_path, audio_data, SAMPLE_RATE)
-        print(f"Saved temp file: {tmp_path}")
-
-        print("Transcribing...")
-        result = model.transcribe(tmp_path, fp16=False)
-        raw_text = result["text"].strip()
-        print(f"Raw: {raw_text}")
-
-        os.remove(tmp_path)
-        print("Temp file deleted.")
-
-        final_text = clean_with_deepseek(raw_text)
-        print(f"Final: {final_text}")
-
-        if final_text:
-            paste_text(final_text)
-            print("Pasted successfully.")
-
-        print("Done.")
-
+        hide_overlay()
     except Exception as e:
-        print(f"ERROR in stop_and_transcribe: {e}")
-        import traceback
-        traceback.print_exc()
+        print(f"Overlay hide error: {e}")
+
+    with buffer_lock:
+        remaining = audio_buffer.copy()
+        audio_buffer = []
+
+    if remaining:
+        remaining_audio = np.concatenate(remaining, axis=0)
+        if len(remaining_audio) >= MIN_AUDIO_LENGTH:
+            print("Transcribing final chunk...")
+            text = transcribe_chunk(remaining_audio)
+            if text:
+                print(f"Final chunk: {text}")
+                transcribed_chunks.append(text)
+
+    if not transcribed_chunks:
+        print("No speech detected.")
+        transcribed_chunks = []
+        return
+
+    full_text = " ".join(transcribed_chunks)
+    print(f"Full raw text: {full_text}")
+    transcribed_chunks = []
+
+    final_text = clean_with_deepseek(full_text)
+
+    if final_text:
+        paste_text(final_text)
+        print("Pasted successfully.")
+
+    print("Done.")
 
 # ─── START RECORDING ──────────────────────────────────
 def start_recording():
-    global is_recording, audio_frames
+    global is_recording, audio_buffer, transcribed_chunks
     is_recording = True
-    audio_frames = []
+    audio_buffer = []
+    transcribed_chunks = []
     print("Recording... Press Ctrl+Win again to stop.")
     start_overlay()
     threading.Thread(target=record_audio, daemon=True).start()
+    threading.Thread(target=chunk_processor, daemon=True).start()
 
 # ─── TOGGLE ───────────────────────────────────────────
 def toggle():
     global is_recording
-    print(f"Toggle called. is_recording = {is_recording}")
     if not is_recording:
         start_recording()
     else:
@@ -175,4 +209,6 @@ def toggle():
 # ─── HOTKEYS ──────────────────────────────────────────
 keyboard.add_hotkey('ctrl+left windows', toggle)
 keyboard.add_hotkey('ctrl+right windows', toggle)
+
+print("Ready. Press Ctrl+Win to start/stop recording.")
 keyboard.wait()
