@@ -1,4 +1,9 @@
-Set WshShell = CreateObject("WScript.Shell")
-WshShell.CurrentDirectory = "C:\path\to\whisper-hotkey"
-WshShell.Run chr(34) & "C:\path\to\whisper-hotkey\run.bat" & chr(34), 0, False
-Set WshShell = Nothing
+' Runs run.bat from this repo folder (same directory as this .vbs file).
+Dim sh, fso, dir
+Set fso = CreateObject("Scripting.FileSystemObject")
+dir = fso.GetParentFolderName(WScript.ScriptFullName)
+Set sh = CreateObject("WScript.Shell")
+sh.CurrentDirectory = dir
+sh.Run Chr(34) & dir & "\run.bat" & Chr(34), 0, False
+Set sh = Nothing
+Set fso = Nothing
